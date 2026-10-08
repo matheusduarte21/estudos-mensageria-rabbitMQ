@@ -2,6 +2,12 @@ require('dotenv').config();
 
 const amqp = require('amqplib');
 
+const MAX_RETRIES = 3;
+
+const PAYMENT_QUEUE = 'payment.queue';
+const PAYMENT_RETRY_QUEUE = 'payment.retry.queue';
+const PAYMENT_DLQ = 'payment.dlq';
+
 async function processPayment(event) {
     console.log('---------------------------');
     console.log('Processando pagamento');
@@ -14,66 +20,197 @@ async function processPayment(event) {
     console.log('---------------------------');
 }
 
-async function startPaymentWorker() {
-    const connection = await amqp.connect(
-        process.env.RABBITMQ_URL
-    );
 
-    const channel = await connection.createChannel();
+function getRetryCount(msg) {
+    return msg.properties.headers?.['x-retry-count'] || 0;
+}
 
-    await channel.assertQueue(
-        'payment.queue',
+
+function sendToRetry(channel, msg) {
+    const retryCount = getRetryCount(msg);
+
+    channel.sendToQueue(
+        PAYMENT_RETRY_QUEUE,
+        msg.content,
         {
-            durable: true
-        }
-    );
+            persistent: true,
+            contentType: 'application/json',
 
-    console.log(
-        'PaymentWorker aguardando mensagens...'
-    );
+            headers: {
+                ...msg.properties.headers,
 
-    channel.consume(
-        'payment.queue',
-
-        async (msg) => {
-            if (!msg) {
-                return;
+                'x-retry-count': retryCount + 1
             }
-
-            try {
-                const content =
-                    msg.content.toString();
-
-                const event =
-                    JSON.parse(content);
-
-                console.log(
-                    'Evento recebido:',
-                    event.eventType
-                );
-
-                await processPayment(event);
-
-                channel.ack(msg);
-
-            } catch (error) {
-                console.error(
-                    'Erro no PaymentWorker:',
-                    error
-                );
-
-                channel.nack(
-                    msg,
-                    false,
-                    false
-                );
-            }
-        },
-
-        {
-            noAck: false
         }
     );
 }
 
+function sendToDlq(channel, msg, error) {
+    channel.sendToQueue(
+        PAYMENT_DLQ,
+        msg.content,
+        {
+            persistent: true,
+            contentType: 'application/json',
+
+            headers: {
+                ...msg.properties.headers,
+
+                'x-error-message': error.message,
+                'x-failed-at': new Date().toISOString()
+            }
+        }
+    );
+}
+
+
+async function handleFailure(channel, msg, error) {
+    const retryCount = getRetryCount(msg);
+
+    if (retryCount < MAX_RETRIES) {
+        console.log(
+            `Falha no processamento. Retry ${retryCount + 1}/${MAX_RETRIES}`
+        );
+
+        sendToRetry(channel, msg);
+        channel.ack(msg);
+
+        return;
+    }
+
+    console.log(
+        `Máximo de retries atingido (${MAX_RETRIES}).`
+    );
+
+    console.log(
+        'Enviando mensagem para payment.dlq...'
+    );
+
+    sendToDlq(channel, msg, error);
+
+    channel.ack(msg);
+}
+
+
+async function startPaymentWorker() {
+    try {
+        const connection = await amqp.connect(
+            process.env.RABBITMQ_URL
+        );
+
+        const channel = await connection.createChannel();
+
+        await channel.assertQueue(
+            PAYMENT_QUEUE,
+            {
+                durable: true
+            }
+        );
+
+        await channel.assertQueue(
+            PAYMENT_RETRY_QUEUE,
+            {
+                durable: true,
+
+                arguments: {
+
+                    'x-message-ttl': 5000,
+                    'x-dead-letter-exchange': '',
+                    'x-dead-letter-routing-key':
+                        PAYMENT_QUEUE
+                }
+            }
+        );
+
+        await channel.assertQueue(
+            PAYMENT_DLQ,
+            {
+                durable: true
+            }
+        );
+
+
+        channel.prefetch(1);
+
+
+        console.log(
+            'PaymentWorker aguardando mensagens...'
+        );
+
+        channel.consume(
+            PAYMENT_QUEUE,
+
+            async (msg) => {
+                if (!msg) {
+                    return;
+                }
+
+                try {
+                    const content =
+                        msg.content.toString();
+
+                    const event =
+                        JSON.parse(content);
+
+
+                    console.log(
+                        `\nEvento recebido: ${event.eventType}`
+                    );
+
+                    console.log(
+                        `Tentativa: ${getRetryCount(msg) + 1}`
+                    );
+
+
+                    await processPayment(event);
+
+
+                    channel.ack(msg);
+
+
+                    console.log(
+                        'ACK enviado ao RabbitMQ.'
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        'Erro no PaymentWorker:',
+                        error.message
+                    );
+
+
+                    await handleFailure(
+                        channel,
+                        msg,
+                        error
+                    );
+                }
+            },
+
+            {
+                noAck: false
+            }
+        );
+
+    } catch (error) {
+        console.error(
+            'Erro ao iniciar PaymentWorker:',
+            error
+        );
+
+        process.exit(1);
+    }
+}
+
+
 startPaymentWorker();
+
+
+module.exports = {
+    startPaymentWorker,
+    getRetryCount,
+    sendToRetry,
+    sendToDlq,
+    handleFailure
+};

@@ -17,9 +17,27 @@ async function connectRabbitMQ() {
         }
     );
 
-    await channel.assertQueue('payment.queue', {
-        durable: true
-    });
+    await channel.assertQueue(
+        'payment.retry.queue',
+        {
+            durable: true,
+
+            arguments: {
+                'x-message-ttl': 5000,
+
+                'x-dead-letter-exchange': '',
+
+                'x-dead-letter-routing-key': 'payment.queue'
+            }
+        }
+    );
+
+    await channel.assertQueue(
+        'payment.dlq',
+        {
+            durable: true
+        }
+    );
 
     await channel.assertQueue('inventory.queue', {
         durable: true
